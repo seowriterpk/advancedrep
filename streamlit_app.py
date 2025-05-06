@@ -1,27 +1,22 @@
 import streamlit as st
-# from bs4 import BeautifulSoup # Still useful for sitemap parsing
-from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 import pandas as pd
 import re
 import time
-import asyncio
-import aiohttp
+from collections import deque
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue # Thread-safe queue
 
-# Selenium imports
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager # Eases driver management
+# --- Constants ---
+USER_AGENT = "WhatsAppLinkExtractor/2.0 (StreamlitApp; +https://your-github-repo)" # BE A GOOD BOT CITIZEN! Update this.
+DEFAULT_REQUEST_DELAY = 0.5  # Seconds between requests PER WORKER
+CONNECT_TIMEOUT = 10 # Seconds to wait for server connection
+READ_TIMEOUT = 15    # Seconds to wait for server response
 
-# --- Constants and Configuration ---
-USER_AGENT_HTTP = "WhatsAppLinkExtractor_SitemapFetcher/2.2"
-USER_AGENT_SELENIUM = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" # More browser-like for Selenium
-WHATSAPP_LINK_PATTERN = re.compile(r"https?://chat\.whatsapp\.com/[A-Za-z0-9\-_]+")
-
-# --- Helper Functions (some from previous versions) ---
+# --- Helper Functions ---
 def is_valid_url(url):
     try:
         result = urlparse(url)
@@ -35,319 +30,370 @@ def get_domain(url):
     except Exception:
         return None
 
-async def fetch_content_async(session, url, delay, headers, log_area):
-    await asyncio.sleep(delay)
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
-            response.raise_for_status()
-            return await response.text()
-    except Exception as e:
-        if log_area: log_area.warning(f"HTTP Error fetching sitemap/page list for {url}: {e}")
-        return None
-
-async def get_urls_from_sitemap_xml_bs(sitemap_xml_content, log_area): # Using BS4 for XML
-    from bs4 import BeautifulSoup # Import here if only used here
-    page_urls = set()
-    sub_sitemap_urls = set()
-    try:
-        soup = BeautifulSoup(sitemap_xml_content, 'xml')
-        for loc_tag in soup.find_all('loc'):
-            url = loc_tag.string.strip()
-            if url.endswith('.xml'):
-                sub_sitemap_urls.add(url)
-            elif is_valid_url(url):
-                page_urls.add(url)
-        if log_area: log_area.info(f"Parsed sitemap: {len(page_urls)} pages, {len(sub_sitemap_urls)} sub-sitemaps.")
-    except Exception as e:
-        if log_area: log_area.error(f"Error parsing sitemap XML: {e}")
-    return page_urls, sub_sitemap_urls
+def find_whatsapp_links_on_page(page_content):
+    pattern = r"https?://chat\.whatsapp\.com/([A-Za-z0-9\-_]+)"
+    # Return full URLs directly
+    return set(f"https://chat.whatsapp.com/{match}" for match in re.findall(pattern, page_content))
 
 
-async def fetch_all_page_urls_from_sitemaps_recursive_bs(initial_sitemap_url, session, delay, headers, log_area):
-    from collections import deque # Import here if only used here
-    all_page_urls_found = set()
-    sitemap_queue = deque([initial_sitemap_url])
-    processed_sitemaps = set()
-
-    while sitemap_queue:
-        current_sitemap_url = sitemap_queue.popleft()
-        if current_sitemap_url in processed_sitemaps:
-            continue
-        processed_sitemaps.add(current_sitemap_url)
-        if log_area: log_area.info(f"Fetching sitemap: {current_sitemap_url}")
-        sitemap_content = await fetch_content_async(session, current_sitemap_url, delay, headers, log_area)
-        if sitemap_content:
-            page_urls, sub_sitemap_urls = await get_urls_from_sitemap_xml_bs(sitemap_content, log_area)
-            all_page_urls_found.update(page_urls)
-            for sub_sitemap in sub_sitemap_urls:
-                if sub_sitemap not in processed_sitemaps:
-                    sitemap_queue.append(sub_sitemap)
-    return all_page_urls_found
-
-# --- Selenium Core Logic ---
-def setup_selenium_driver():
-    """Sets up and returns a Selenium WebDriver."""
-    chrome_options = Options()
-    chrome_options.add_argument("--headless") # Run in background
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu") # Often recommended for headless
-    chrome_options.add_argument(f"user-agent={USER_AGENT_SELENIUM}")
-    
-    # This is the tricky part for Streamlit Cloud.
-    # webdriver_manager handles download locally.
-    # For Streamlit Cloud, you'd need chromedriver in PATH or specify its location.
-    try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
-    except Exception as e:
-        st.error(f"Failed to initialize Selenium WebDriver: {e}. "
-                 "Ensure ChromeDriver is installed and accessible, or you are running in an environment that supports it (like local).")
-        return None
-
-def scrape_page_with_selenium(driver, page_url, wait_time_after_load, join_button_text_selector, status_log):
+# --- Crawler Worker Function ---
+def worker_task(url_to_crawl, current_depth, start_domain, visited_urls_lock, visited_urls_shared,
+                task_queue_shared, results_queue_shared, new_links_to_process_queue,
+                max_depth_crawl, stop_event, request_delay_worker):
     """
-    Navigates to a page, optionally clicks a join button, waits, and gets the final URL.
+    Worker function to fetch and process a single URL.
+    Puts results (WhatsApp links, new internal URLs) into respective queues.
     """
-    try:
-        status_log.info(f"Selenium: Navigating to {page_url}")
-        driver.get(page_url)
-        
-        # Wait for initial page elements if necessary (e.g., body to be present)
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    if stop_event.is_set():
+        return None, [], 0 # Signal to stop
 
-        if join_button_text_selector:
-            status_log.info(f"Selenium: Looking for join button with text/selector: '{join_button_text_selector}'")
-            try:
-                # Try finding by partial link text first (common for "Join Group")
-                # You might need more robust selectors (CSS selector, XPath)
-                join_button = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, join_button_text_selector))
-                )
-                # Alternative selectors (more complex to implement generically here):
-                # join_button = driver.find_element(By.XPATH, f"//*[contains(text(), '{join_button_text_selector}') and (self::a or self::button)]")
-                # join_button = driver.find_element(By.CSS_SELECTOR, join_button_text_selector) # If it's a CSS selector
+    # Construct a unique key for visited_urls (URL without fragment)
+    parsed_url_key = urlparse(url_to_crawl)
+    url_key_for_visited = parsed_url_key._replace(fragment="").geturl()
 
-                status_log.info(f"Selenium: Found join button, clicking...")
-                join_button.click()
-                # Wait for potential navigation or new content after click
-                time.sleep(1) # Small fixed wait after click, adjust as needed
-            except Exception as e:
-                status_log.warning(f"Selenium: Could not find or click join button '{join_button_text_selector}' on {page_url}. Error: {e}. Proceeding to wait on current page.")
-        
-        status_log.info(f"Selenium: Waiting {wait_time_after_load}s for JS redirect on {driver.current_url} (was {page_url})")
-        time.sleep(wait_time_after_load) # Wait for the JS timer
+    with visited_urls_lock:
+        if url_key_for_visited in visited_urls_shared:
+            return None, [], 0 # Already visited or added to queue
+        visited_urls_shared.add(url_key_for_visited)
 
-        final_url = driver.current_url
-        status_log.info(f"Selenium: Final URL after wait: {final_url}")
-
-        match = WHATSAPP_LINK_PATTERN.search(final_url)
-        if match:
-            return match.group(0) # Return the full WhatsApp link
-        # Also check page source for the link if redirect didn't change URL but loaded content
-        page_source_match = WHATSAPP_LINK_PATTERN.search(driver.page_source)
-        if page_source_match:
-             status_log.info(f"Selenium: Found WhatsApp link in page source of {final_url}")
-             return page_source_match.group(0)
-
-    except Exception as e:
-        status_log.error(f"Selenium: Error processing {page_url}: {e}")
-    return None
-
-async def run_sitemap_scraper_with_selenium(
-    sitemap_url_input, 
-    request_delay_sitemap, # For fetching sitemap URLs
-    selenium_wait_time, 
-    join_button_selector,
-    progress_bar_ref, status_text_ref, detailed_log_area_ref
-):
-    all_found_whatsapp_links = set()
-    pages_processed_count = 0
-    processed_page_results = [] # (url, status, found_link)
-
-    # 1. Fetch all page URLs from sitemap using aiohttp (fast)
-    headers_http = {'User-Agent': USER_AGENT_HTTP}
-    async with aiohttp.ClientSession(headers=headers_http) as session:
-        if detailed_log_area_ref: detailed_log_area_ref.info(f"Fetching page URLs from: {sitemap_url_input}")
-        page_urls_to_scrape = await fetch_all_page_urls_from_sitemaps_recursive_bs(
-            sitemap_url_input, session, request_delay_sitemap, headers_http, detailed_log_area_ref
-        )
-
-    if not page_urls_to_scrape:
-        status_text_ref.error("No page URLs found from the sitemap(s).")
-        if progress_bar_ref: progress_bar_ref.progress(1.0)
-        return set(), 0, []
-
-    total_urls = len(page_urls_to_scrape)
-    status_text_ref.info(f"Found {total_urls} page URLs. Initializing Selenium for scraping...")
-    if progress_bar_ref: progress_bar_ref.progress(0.0)
-
-    # 2. Initialize Selenium Driver (once, if possible, or manage its lifecycle carefully)
-    # For simplicity here, we'll re-init if it fails, but ideally, manage one driver.
-    # Running many Selenium instances can be heavy. This will process sequentially.
-    driver = setup_selenium_driver()
-    if not driver:
-        status_text_ref.error("Selenium WebDriver could not be initialized. Aborting.")
-        return set(), 0, []
+    thread_id = threading.get_ident()
+    # st.write(f"[Thread {thread_id}] Crawling (Depth {current_depth}): {url_to_crawl}") # Too noisy for main UI
 
     try:
-        for i, page_url in enumerate(page_urls_to_scrape):
-            status_text_ref.info(f"Processing URL {i+1}/{total_urls}: {page_url}")
-            
-            whatsapp_link = scrape_page_with_selenium(
-                driver, page_url, selenium_wait_time, join_button_selector, detailed_log_area_ref
-            )
-            pages_processed_count += 1
+        time.sleep(request_delay_worker) # Politeness delay per worker
+        headers = {'User-Agent': USER_AGENT}
+        response = requests.get(url_to_crawl, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        response.raise_for_status()
 
-            if whatsapp_link:
-                all_found_whatsapp_links.add(whatsapp_link)
-                processed_page_results.append((page_url, "Success", whatsapp_link))
-                detailed_log_area_ref.success(f"Found: {whatsapp_link} on {page_url}")
-            else:
-                processed_page_results.append((page_url, "No WhatsApp link found after JS wait", None))
-                detailed_log_area_ref.warning(f"No link found for: {page_url}")
+        content_type = response.headers.get('content-type', '').lower()
+        if 'text/html' not in content_type:
+            # st.write(f"[Thread {thread_id}] Skipping non-HTML: {url_to_crawl}")
+            return url_to_crawl, [], 1 # Page processed (attempted)
 
-            if progress_bar_ref: progress_bar_ref.progress((i + 1) / total_urls)
-            
-            # Brief pause between pages to be slightly gentler
-            time.sleep(0.5) # Small delay between processing each URL with Selenium
+        soup = BeautifulSoup(response.text, 'html.parser')
+        page_whatsapp_links = find_whatsapp_links_on_page(response.text)
+        for link in page_whatsapp_links:
+            results_queue_shared.put(link)
 
+        found_internal_links = []
+        if current_depth < max_depth_crawl:
+            for link_tag in soup.find_all('a', href=True):
+                href = link_tag['href']
+                absolute_link = urljoin(url_to_crawl, href)
+                parsed_link = urlparse(absolute_link)
+                clean_link = parsed_link._replace(fragment="").geturl() # Remove fragment for queue
+
+                if is_valid_url(clean_link) and get_domain(clean_link) == start_domain:
+                    # Check visited again before adding to prevent race condition additions
+                    # The main check is at the start of this function, this is a secondary check
+                    with visited_urls_lock:
+                        if clean_link not in visited_urls_shared:
+                             # We don't add to visited_urls_shared here, but at the start of worker_task
+                             # when it's popped from the queue.
+                            found_internal_links.append((clean_link, current_depth + 1))
+
+        # Instead of directly adding to task_queue_shared from worker,
+        # put them in a temporary queue for the main thread to manage.
+        # This simplifies task_queue_shared management and makes progress tracking easier.
+        if found_internal_links:
+            new_links_to_process_queue.put(found_internal_links)
+
+        return url_to_crawl, list(page_whatsapp_links), 1 # URL, its WhatsApp links, 1 page processed
+
+    except requests.exceptions.Timeout:
+        # st.write(f"[Thread {thread_id}] Timeout: {url_to_crawl}")
+        st.session_state.error_messages.append(f"Timeout fetching: {url_to_crawl}")
+        return url_to_crawl, [], 1 # Still counts as processed (attempted)
+    except requests.exceptions.RequestException as e:
+        # st.write(f"[Thread {thread_id}] Request Error {url_to_crawl}: {e}")
+        st.session_state.error_messages.append(f"Failed: {url_to_crawl} ({type(e).__name__})")
+        return url_to_crawl, [], 1 # Still counts as processed (attempted)
     except Exception as e:
-        status_text_ref.error(f"An error occurred during Selenium processing: {e}")
-        detailed_log_area_ref.error(f"Critical Selenium error: {e}")
-    finally:
-        if driver:
-            driver.quit()
-            status_text_ref.info("Selenium WebDriver closed.")
-
-    if progress_bar_ref: progress_bar_ref.progress(1.0)
-    return all_found_whatsapp_links, pages_processed_count, processed_page_results
+        # st.write(f"[Thread {thread_id}] Processing Error {url_to_crawl}: {e}")
+        st.session_state.error_messages.append(f"Error processing: {url_to_crawl} ({type(e).__name__})")
+        return url_to_crawl, [], 1 # Still counts as processed (attempted)
 
 # --- Streamlit App UI ---
-st.set_page_config(page_title="Advanced WhatsApp Link Extractor", layout="wide")
-st.title("🔗 Advanced WhatsApp Link Extractor (Sitemap + JS Timer)")
+st.set_page_config(page_title="Fast WhatsApp Link Extractor", layout="wide")
+st.title("🚀 Fast WhatsApp Group Link Extractor (Concurrent)")
 st.markdown("""
-This app fetches URLs from a sitemap and then uses **Selenium** to visit each page,
-wait for potential JavaScript timers/redirects, and extract WhatsApp group links.
-
-**IMPORTANT:**
-- This version uses Selenium, which requires a browser (e.g., Chrome) and its driver (ChromeDriver) to be installed.
-- It's designed primarily for **local execution**. Deployment on Streamlit Cloud free tier is challenging due to Selenium's dependencies.
-- The "Join Button Selector" is crucial if navigation to a timer page is needed. Start with button text (e.g., "Join Group"). For complex cases, CSS selectors or XPath might be needed (advanced).
+This app attempts to quickly scan a website using concurrent workers to extract WhatsApp group join links.
+**Use responsibly! High concurrency can strain servers.**
+Adjust concurrency, crawling depth, and view live progress.
 """)
 
-st.sidebar.header("Sitemap & Fetching Settings")
-sitemap_url_input = st.sidebar.text_input(
-    "Enter Sitemap URL:",
-    placeholder="e.g., https://example.com/sitemap.xml"
-)
-request_delay_sitemap_fetch = st.sidebar.slider(
-    "Delay for Sitemap Fetch (s):", 0.0, 2.0, 0.1, 0.05,
-    help="Delay between requests when fetching sitemap files themselves."
-)
-
-st.sidebar.header("Selenium Settings")
-selenium_wait_time = st.sidebar.slider(
-    "JS Timer Wait (seconds):", 1, 15, 5,
-    help="How long to wait on a page for JavaScript timers/redirects to complete. Your site needs ~3s."
-)
-join_button_text_css_xpath = st.sidebar.text_input(
-    "Join Button Text / CSS Selector / XPath:",
-    placeholder="e.g., Join Group OR #joinButtonId OR //button[contains(text(),'Join')]",
-    help="Text of the button to click to reach the timer page. Or a CSS/XPath selector. Leave blank if direct page has timer."
-)
+# --- Initialize Session State ---
+if 'crawling_in_progress' not in st.session_state:
+    st.session_state.crawling_in_progress = False
+if 'found_whatsapp_links_set' not in st.session_state: # Store unique links
+    st.session_state.found_whatsapp_links_set = set()
+if 'displayed_whatsapp_links' not in st.session_state: # For live display
+    st.session_state.displayed_whatsapp_links = []
+if 'pages_crawled_count' not in st.session_state:
+    st.session_state.pages_crawled_count = 0
+if 'urls_in_queue_count' not in st.session_state:
+    st.session_state.urls_in_queue_count = 0
+if 'start_url_processed' not in st.session_state:
+    st.session_state.start_url_processed = ""
+if 'error_messages' not in st.session_state:
+    st.session_state.error_messages = []
+if 'stop_event' not in st.session_state:
+    st.session_state.stop_event = threading.Event()
 
 
-# Session state
-if 'adv_scraping_done' not in st.session_state:
-    st.session_state.adv_scraping_done = False
-# ... (initialize other session state vars if needed)
+# --- Input Fields ---
+with st.sidebar:
+    st.header("⚙️ Crawler Settings")
+    start_url_input = st.text_input(
+        "Enter Starting URL:",
+        placeholder="e.g., https://example.com",
+        value=st.session_state.get('last_start_url', "")
+    )
+    max_depth_input = st.slider(
+        "Crawling Depth (0 for start page):", 0, 10, 1,
+        help="Max link 'clicks' from start. Higher values increase time/pages significantly."
+    )
+    num_workers_input = st.slider(
+        "Number of Concurrent Workers:", 1, 10, 3,
+        help="More workers = faster, but more server load. Be cautious!"
+    )
+    request_delay_input = st.number_input(
+        "Delay per Request (seconds):", min_value=0.1, max_value=5.0, value=DEFAULT_REQUEST_DELAY, step=0.1,
+        help="Politeness delay for each worker's request."
+    )
+
+col_start, col_stop = st.columns(2)
+with col_start:
+    if st.button("🚀 Start Crawling", type="primary", disabled=st.session_state.crawling_in_progress, use_container_width=True):
+        if not start_url_input:
+            st.error("⚠️ Please enter a starting URL.")
+        elif not is_valid_url(start_url_input):
+            st.error("⚠️ Please enter a valid URL (e.g., http:// or https://).")
+        else:
+            # Reset state for a new crawl
+            st.session_state.crawling_in_progress = True
+            st.session_state.found_whatsapp_links_set = set()
+            st.session_state.displayed_whatsapp_links = []
+            st.session_state.pages_crawled_count = 0
+            st.session_state.urls_in_queue_count = 0
+            st.session_state.start_url_processed = start_url_input
+            st.session_state.last_start_url = start_url_input # Remember for next time
+            st.session_state.error_messages = []
+            st.session_state.stop_event.clear()
+
+            # Initialize queues and shared structures for this crawl
+            st.session_state.task_queue = deque([(start_url_input, 0)])
+            st.session_state.results_queue = queue.Queue() # For WhatsApp links
+            st.session_state.new_links_to_process_queue = queue.Queue() # For new internal URLs from workers
+            st.session_state.visited_urls = set() # URLs added to task_queue or processed
+            st.session_state.visited_urls_lock = threading.Lock()
+
+            # Add initial URL to visited (it's in task_queue)
+            with st.session_state.visited_urls_lock:
+                 parsed_initial = urlparse(start_url_input)
+                 st.session_state.visited_urls.add(parsed_initial._replace(fragment="").geturl())
+
+            st.session_state.urls_in_queue_count = 1
+            st.info(f"🚀 Crawl started for {start_url_input} with {num_workers_input} workers, depth {max_depth_input}.")
+
+with col_stop:
+    if st.button("🛑 Stop Crawling", disabled=not st.session_state.crawling_in_progress, use_container_width=True):
+        st.session_state.stop_event.set()
+        st.warning("🛑 Stop signal sent. Workers will finish current tasks and stop.")
+        # The main loop will eventually see crawling_in_progress become False
 
 
-if st.button("🚀 Start Advanced Scraping", type="primary"):
-    if not sitemap_url_input:
-        st.error("⚠️ Please enter a Sitemap URL.")
-    elif not is_valid_url(sitemap_url_input):
-        st.error("⚠️ Please enter a valid URL for the sitemap.")
+# --- Live Status Placeholders ---
+status_col1, status_col2, status_col3 = st.columns(3)
+pages_crawled_placeholder = status_col1.empty()
+links_found_placeholder = status_col2.empty()
+queue_size_placeholder = status_col3.empty()
+progress_bar_placeholder = st.empty()
+live_links_header_placeholder = st.empty()
+live_links_display_placeholder = st.empty() # For DataFrame
+error_messages_placeholder = st.empty()
+
+# --- Main Crawling Loop (if active) ---
+if st.session_state.crawling_in_progress:
+    start_domain_crawl = get_domain(st.session_state.start_url_processed)
+
+    # Check if we need to start the ThreadPoolExecutor
+    if 'executor' not in st.session_state or st.session_state.executor is None:
+        st.session_state.executor = ThreadPoolExecutor(max_workers=num_workers_input)
+        st.session_state.futures = [] # To keep track of submitted tasks
+
+    # Submit initial tasks from task_queue if futures list is empty
+    # and executor exists
+    if st.session_state.executor and not st.session_state.futures:
+        with st.session_state.visited_urls_lock: # Ensure task_queue is accessed safely if needed
+            # Only submit new tasks if queue is not empty
+            tasks_to_submit_count = min(len(st.session_state.task_queue), num_workers_input * 2) # Submit a batch
+            for _ in range(tasks_to_submit_count):
+                if not st.session_state.task_queue:
+                    break
+                url, depth = st.session_state.task_queue.popleft()
+                # visited_urls_shared is st.session_state.visited_urls
+                # task_queue_shared is st.session_state.task_queue
+                # results_queue_shared is st.session_state.results_queue
+                future = st.session_state.executor.submit(
+                    worker_task, url, depth, start_domain_crawl,
+                    st.session_state.visited_urls_lock,
+                    st.session_state.visited_urls,
+                    st.session_state.task_queue, # For potential direct additions (though we use intermediate queue)
+                    st.session_state.results_queue,
+                    st.session_state.new_links_to_process_queue,
+                    max_depth_input,
+                    st.session_state.stop_event,
+                    request_delay_input
+                )
+                st.session_state.futures.append(future)
+
+    # Process completed futures
+    new_futures = []
+    for future in st.session_state.futures:
+        if future.done():
+            if st.session_state.stop_event.is_set():
+                continue # Skip processing if stopping
+
+            try:
+                processed_url, _ , pages_increment = future.result() # We get WA links via results_queue
+                if pages_increment:
+                    st.session_state.pages_crawled_count += pages_increment
+            except Exception as e:
+                st.session_state.error_messages.append(f"Worker error: {e}")
+                st.session_state.pages_crawled_count += 1 # Count as attempted
+        else:
+            new_futures.append(future) # Keep non-done futures
+    st.session_state.futures = new_futures
+
+    # Process newly discovered internal links from workers
+    while not st.session_state.new_links_to_process_queue.empty():
+        links_batch = st.session_state.new_links_to_process_queue.get_nowait()
+        with st.session_state.visited_urls_lock:
+            for link_url, link_depth in links_batch:
+                # Check visited_urls again here before adding to task_queue
+                # url_key_for_visited logic should be applied before this check if not already
+                parsed_new_link = urlparse(link_url)
+                new_link_key = parsed_new_link._replace(fragment="").geturl()
+                if new_link_key not in st.session_state.visited_urls:
+                    st.session_state.visited_urls.add(new_link_key) # Mark as added to queue
+                    st.session_state.task_queue.append((link_url, link_depth))
+
+
+    # Replenish futures from task_queue if workers are available
+    # and not stopping
+    if st.session_state.executor and not st.session_state.stop_event.is_set():
+        num_active_futures = len(st.session_state.futures)
+        available_slots = num_workers_input - num_active_futures
+        if available_slots > 0:
+            with st.session_state.visited_urls_lock: # Protect task_queue access
+                tasks_to_submit_count = min(len(st.session_state.task_queue), available_slots)
+                for _ in range(tasks_to_submit_count):
+                    if not st.session_state.task_queue:
+                        break
+                    url, depth = st.session_state.task_queue.popleft()
+                    future = st.session_state.executor.submit(
+                        worker_task, url, depth, start_domain_crawl,
+                        st.session_state.visited_urls_lock,
+                        st.session_state.visited_urls,
+                        st.session_state.task_queue,
+                        st.session_state.results_queue,
+                        st.session_state.new_links_to_process_queue,
+                        max_depth_input,
+                        st.session_state.stop_event,
+                        request_delay_input
+                    )
+                    st.session_state.futures.append(future)
+
+
+    # Collect WhatsApp links from results_queue
+    while not st.session_state.results_queue.empty():
+        link = st.session_state.results_queue.get_nowait()
+        if link not in st.session_state.found_whatsapp_links_set:
+            st.session_state.found_whatsapp_links_set.add(link)
+            st.session_state.displayed_whatsapp_links.append(link) # Add to list for display
+
+    # Update live counters
+    st.session_state.urls_in_queue_count = len(st.session_state.task_queue) + len(st.session_state.futures) # Approx
+
+    pages_crawled_placeholder.metric("Pages Crawled/Attempted", st.session_state.pages_crawled_count)
+    links_found_placeholder.metric("Unique WhatsApp Links", len(st.session_state.found_whatsapp_links_set))
+    queue_size_placeholder.metric("URLs in Queue", st.session_state.urls_in_queue_count)
+
+    # Progress Bar
+    total_known_urls = len(st.session_state.visited_urls) # URLs that are or have been in queue
+    if total_known_urls > 0 :
+        progress_val = min(1.0, st.session_state.pages_crawled_count / total_known_urls if total_known_urls else 0)
+        progress_bar_placeholder.progress(progress_val)
     else:
-        st.session_state.adv_scraping_done = False
-        st.session_state.adv_found_links = []
-        st.session_state.adv_pages_scraped = 0
-        st.session_state.adv_processed_results = []
-
-        progress_bar_placeholder = st.empty()
-        status_text_placeholder = st.empty()
-        detailed_log_expander = st.expander("Detailed Processing Log (Selenium)", expanded=True)
-        detailed_log_area = detailed_log_expander.empty()
-
-        progress_bar = progress_bar_placeholder.progress(0)
-        status_text_placeholder.info("🚀 Initializing advanced scraper...")
-
-        try:
-            # Selenium part is synchronous, but sitemap fetching can be async
-            # For simplicity in integrating, we'll run the main orchestrator that uses async for sitemap
-            # and then sync for selenium processing.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Note: run_sitemap_scraper_with_selenium is not fully async itself because of Selenium.
-            # It uses asyncio only for the initial sitemap URL fetching.
-            # A more complex setup would use threads for Selenium tasks if true parallel Selenium was desired.
-            # For now, Selenium will process URLs one by one.
-            
-            # Directly call the orchestrator, which will handle its async part
-            found_links_set, pages_scraped, processed_results = loop.run_until_complete(
-                 run_sitemap_scraper_with_selenium(
-                    sitemap_url_input,
-                    request_delay_sitemap_fetch,
-                    selenium_wait_time,
-                    join_button_text_css_xpath,
-                    progress_bar,
-                    status_text_placeholder,
-                    detailed_log_area
-                )
-            )
-            
-            st.session_state.adv_found_links = sorted(list(found_links_set))
-            st.session_state.adv_pages_scraped = pages_scraped
-            st.session_state.adv_processed_results = processed_results
-            st.session_state.adv_scraping_done = True
-
-            if st.session_state.adv_found_links:
-                status_text_placeholder.success(
-                    f"✅ Advanced scraping complete! Found {len(st.session_state.adv_found_links)} unique WhatsApp links "
-                    f"from {st.session_state.adv_pages_scraped} pages processed using Selenium."
-                )
-            else:
-                status_text_placeholder.info(
-                    f"ℹ️ Advanced scraping complete. No WhatsApp links found after processing "
-                    f"{st.session_state.adv_pages_scraped} pages with Selenium."
-                )
-            progress_bar_placeholder.empty()
-
-        except Exception as e:
-            st.error(f"An unexpected error occurred during advanced scraping: {e}")
-            import traceback
-            detailed_log_area.error(traceback.format_exc())
-            status_text_placeholder.error(f"Scraping failed: {e}")
-            if progress_bar_placeholder: progress_bar_placeholder.empty()
+        progress_bar_placeholder.progress(0)
 
 
-# Display results
-if st.session_state.get('adv_scraping_done', False): # Use .get for safety
-    st.subheader(f"📊 Selenium Results: {len(st.session_state.adv_found_links)} links from {st.session_state.adv_pages_scraped} pages")
-    if st.session_state.adv_found_links:
-        df_links = pd.DataFrame(st.session_state.adv_found_links, columns=["WhatsApp Group Link (via Selenium)"])
+    # Live display of found links
+    if st.session_state.displayed_whatsapp_links:
+        live_links_header_placeholder.subheader(f"🔗 Live View: Found WhatsApp Links ({len(st.session_state.displayed_whatsapp_links)})")
+        # Display as a list for simplicity with live updates
+        # Using st.code or st.text for dynamic updates might be lighter than st.dataframe
+        # For many links, st.dataframe is better but might be slower to update live.
+        # Let's use a text area that can grow.
+        links_text = "\n".join(st.session_state.displayed_whatsapp_links)
+        live_links_display_placeholder.text_area("Links:", links_text, height=200, key="live_links_text_area")
+
+
+    # Display error messages
+    if st.session_state.error_messages:
+        error_messages_placeholder.expander("⚠️ Encountered Errors/Warnings").warning("\n".join(st.session_state.error_messages[-20:])) # Show last 20
+
+    # Check for crawl completion or stop signal
+    if st.session_state.stop_event.is_set() or \
+       (not st.session_state.task_queue and not st.session_state.futures):
+        st.session_state.crawling_in_progress = False
+        if st.session_state.executor:
+            st.session_state.executor.shutdown(wait=True) # Wait for threads to finish
+            st.session_state.executor = None
+        st.session_state.futures = []
+
+        if st.session_state.stop_event.is_set():
+            st.success("✅ Crawl stopped by user. Processed results up to this point are shown.")
+        else:
+            st.success(f"✅ Crawl finished! Checked {st.session_state.pages_crawled_count} pages. Found {len(st.session_state.found_whatsapp_links_set)} unique WhatsApp links.")
+        progress_bar_placeholder.progress(1.0) # Ensure it shows 100%
+        # Clear live update placeholders after completion if desired, or leave them
+        # live_links_header_placeholder.empty()
+        # live_links_display_placeholder.empty()
+
+    # Rerun periodically to update UI from thread activity
+    if st.session_state.crawling_in_progress:
+        time.sleep(0.5) # Adjust for responsiveness vs. CPU usage
+        st.rerun()
+
+# --- Display Final Results (after crawl stops or is complete) ---
+if not st.session_state.crawling_in_progress and st.session_state.start_url_processed: # Only show if a crawl was run
+    st.markdown("---")
+    st.subheader(f"📊 Final Results for {st.session_state.start_url_processed}")
+    st.write(f"Total pages crawled/attempted: {st.session_state.pages_crawled_count}")
+    st.write(f"Total unique WhatsApp links found: {len(st.session_state.found_whatsapp_links_set)}")
+
+    if st.session_state.found_whatsapp_links_set:
+        final_links_list = sorted(list(st.session_state.found_whatsapp_links_set))
+        df_links = pd.DataFrame(final_links_list, columns=["WhatsApp Group Link"])
         st.dataframe(df_links, use_container_width=True)
-        # ... (CSV download button)
+
+        csv_data = df_links.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download All Found Links as CSV",
+            data=csv_data,
+            file_name=f"whatsapp_links_{get_domain(st.session_state.start_url_processed) or 'extracted'}.csv",
+            mime='text/csv',
+        )
     else:
-        st.info("No WhatsApp links found by Selenium.")
-    
-    if st.session_state.adv_processed_results:
-        with st.expander("Show Detailed Selenium Page Processing Summary"):
-            df_summary = pd.DataFrame(st.session_state.adv_processed_results, columns=["Page URL", "Selenium Status", "Found Link"])
-            st.dataframe(df_summary, use_container_width=True)
+        st.info("No WhatsApp group links were found.")
+
+    if st.session_state.error_messages:
+        with st.expander("⚠️ View All Encountered Errors/Warnings During Crawl"):
+            st.json(st.session_state.error_messages)
+
 
 st.markdown("---")
-st.markdown("Selenium-based scraper. Remember to respect website terms.")
+st.markdown("Built with [Streamlit](https://streamlit.io). "
+            "**Warning:** Aggressive crawling can lead to IP blocks. Use responsibly and respect website terms.")
