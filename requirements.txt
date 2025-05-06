@@ -1,6 +1,8 @@
 streamlit
 requests
-beautifulsoup4
+beautifulsoup4 # For sitemap parsing
 pandas
 aiohttp
-lxml # Recommended XML parser for BeautifulSoup, though bs4 can use html.parser or xml.etree
+selenium
+webdriver-manager # For easy local ChromeDriver management
+lxml # Good for bs4 XML parsing
