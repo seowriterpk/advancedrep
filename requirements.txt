@@ -2,4 +2,5 @@ streamlit
 requests
 beautifulsoup4
 pandas
-httpx
+aiohttp
+lxml # Recommended XML parser for BeautifulSoup, though bs4 can use html.parser or xml.etree
