@@ -360,8 +360,8 @@ if start_button:
             # logger.exception("Unhandled exception in crawl execution:")
         finally:
             st.session_state.crawling_in_progress = False
-            st.experimental_rerun() # To re-enable button and update UI correctly
-
+# NEW
+st.rerun() # To re-enable button and update UI correctly
 # --- Display Results ---
 st.subheader("📊 Results")
 if not st.session_state.found_links_df.empty:
